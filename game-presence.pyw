@@ -1,6 +1,27 @@
 import time
 import sys
+import logging
+import pygetwindow as gw
 from pypresence import Presence, InvalidID, PipeClosed, DiscordNotFound, DiscordError
+
+# ------------------------------------------------------------------
+# LOGGING CONFIGURATION
+# ------------------------------------------------------------------
+logging.basicConfig(
+    filename='game-presence.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    encoding='utf-8'
+)
+# Also print to console if available
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger().addHandler(console)
+
+# ------------------------------------------------------------------
+# CONSTANTS
+# ------------------------------------------------------------------
+POLL_INTERVAL = 15  # Seconds between each game detection check
 
 # ------------------------------------------------------------------
 # MULTI-GAME CONFIGURATION
@@ -46,9 +67,9 @@ GAMES = [
 
 def get_active_game():
     try:
-        import pygetwindow as gw
         windows = gw.getAllTitles()
-    except:
+    except Exception as e:
+        logging.warning(f"Failed to read window titles: {e}")
         return None
 
     for game in GAMES:
@@ -83,64 +104,81 @@ def main():
     current_rpc = None
     current_client_id = None
     start_time = None
+    last_game_name = None  # Track last game to skip redundant updates
 
-    print("Script started. Searching for games...")
+    logging.info("Script started. Searching for games...")
 
-    while True:
-        try:
-            active_game = get_active_game()
-            
-            if active_game:
+    try:
+        while True:
+            try:
+                active_game = get_active_game()
                 
-                # Check if it need to switch games (e.g. from GBF to Nikke)
-                if active_game['client_id'] != current_client_id:
-                    print(f"Detected: {active_game['name']}")
+                if active_game:
                     
-                    # Close old connection if it exists
-                    if current_rpc:
+                    # Check if it need to switch games (e.g. from GBF to Nikke)
+                    if active_game['client_id'] != current_client_id:
+                        logging.info(f"Detected: {active_game['name']}")
+                        
+                        # Close old connection if it exists
+                        if current_rpc:
+                            try:
+                                current_rpc.close()
+                            except Exception:
+                                pass
+                        
+                        # Connect to new ID
+                        current_client_id = active_game['client_id']
+                        current_rpc = Presence(current_client_id)
+                        current_rpc.connect()
+                        start_time = time.time() # Reset timer for new game
+                        last_game_name = None  # Force an update on first tick
+                    
+                    # Only update if game changed (avoid redundant RPC calls)
+                    if active_game['name'] != last_game_name:
+                        current_rpc.update(
+                            details=active_game.get('details'),
+                            large_image=active_game['image_key'],
+                            large_text=active_game['image_text'],
+                            buttons=active_game.get('buttons'),
+                            start=start_time
+                        )
+                        last_game_name = active_game['name']
+                    
+                else:
+                    # --- NO GAME FOUND ---
+                    if current_rpc and current_client_id:
+                        logging.info("Game closed. Clearing status.")
                         try:
+                            current_rpc.clear()
                             current_rpc.close()
-                        except:
+                        except Exception:
                             pass
-                    
-                    # Connect to new ID
-                    current_client_id = active_game['client_id']
-                    current_rpc = Presence(current_client_id)
-                    current_rpc.connect()
-                    start_time = time.time() # Reset timer for new game
-                
-                # Update Status
-                current_rpc.update(
-                    details=active_game.get('details'),
-                    large_image=active_game['image_key'],
-                    large_text=active_game['image_text'],
-                    buttons=active_game.get('buttons'),
-                    start=start_time
-                )
-                
-            else:
-                # --- NO GAME FOUND ---
-                if current_rpc and current_client_id:
-                    print("Game closed. Clearing status.")
-                    try:
-                        current_rpc.clear()
-                        current_rpc.close()
-                    except:
-                        pass
-                    current_rpc = None
-                    current_client_id = None
+                        current_rpc = None
+                        current_client_id = None
+                        last_game_name = None
 
-            time.sleep(15)
+                time.sleep(POLL_INTERVAL)
 
-        except (PipeClosed, InvalidID, ConnectionError, DiscordNotFound, DiscordError, FileNotFoundError):
-            # Discord crashed or restarted, reset everything
-            current_rpc = None
-            current_client_id = None
-            time.sleep(10)
-            
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(10)
+            except (PipeClosed, InvalidID, ConnectionError, DiscordNotFound, DiscordError, FileNotFoundError):
+                # Discord crashed or restarted, reset everything
+                logging.warning("Discord connection lost. Reconnecting...")
+                current_rpc = None
+                current_client_id = None
+                last_game_name = None
+                time.sleep(10)
+                
+            except Exception as e:
+                logging.error(f"Unexpected error: {e}")
+                time.sleep(10)
+
+    except KeyboardInterrupt:
+        logging.info("Script stopped by user. Goodbye!")
+        if current_rpc:
+            try:
+                current_rpc.clear()
+                current_rpc.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
