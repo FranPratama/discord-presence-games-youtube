@@ -2,7 +2,6 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.pyo
 
 # Virtual Environment
 venv/
@@ -11,6 +10,7 @@ env/
 
 # Logs
 *.log
+*.log.*
 
 # IDE
 .vscode/
