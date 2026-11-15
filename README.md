@@ -6,7 +6,7 @@ Two small Python scripts that show what you're doing on Discord. One handles gam
 
 **game-presence.pyw** looks at your open window titles every 15 seconds. When it finds a game from its list, it shows that game on your Discord profile with a timer and a couple of buttons. Right now it knows Granblue Fantasy (in Chrome) and NIKKE, but adding more is just a matter of editing the `GAMES` list at the top of the file.
 
-**youtube-presence.pyw** reads what Windows itself reports as "now playing", the same info you see in the volume flyout. When that's YouTube or YouTube Music in your browser, it shows the title, artist, cover art, a progress bar, and a link back to the song or video. It reacts to play, pause, skip and seek almost instantly, and it tries to stay quiet while ads are playing.
+**youtube-presence.pyw** reads what Windows itself reports as "now playing", the same info you see in the volume flyout. When that's YouTube or YouTube Music in your browser, it shows the title, artist, album, cover art, a progress bar, and a link back to the song or video. It reacts to play, pause, skip and seek almost instantly, and it tries to stay quiet while ads are playing.
 
 ## Setup
 

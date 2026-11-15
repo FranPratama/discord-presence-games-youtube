@@ -1,10 +1,11 @@
+import logging
 import sys
 import time
-import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
 import pygetwindow as gw
-from pypresence import Presence, InvalidID, PipeClosed, DiscordNotFound, DiscordError
+from pypresence import DiscordError, DiscordNotFound, InvalidID, PipeClosed, Presence
 
 LOG_PATH = Path(__file__).with_name('game-presence.log')
 

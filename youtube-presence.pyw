@@ -1,29 +1,28 @@
+import asyncio
+import json
+import logging
 import re
 import sys
 import time
-import asyncio
-import logging
-import urllib.request
 import urllib.parse
-import json
+import urllib.request
 from collections import deque
 from difflib import SequenceMatcher
 from functools import lru_cache, partial
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+import pygetwindow as gw
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import winrt.windows.foundation
 from pypresence import AioPresence, exceptions
 from pypresence.types import ActivityType
-import pygetwindow as gw
-from ytmusicapi import YTMusic
-
-import winrt.windows.foundation
-
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from winrt.windows.media.control import \
     GlobalSystemMediaTransportControlsSessionManager, \
     GlobalSystemMediaTransportControlsSessionPlaybackStatus
+from ytmusicapi import YTMusic
 
 LOG_PATH = Path(__file__).with_name('youtube-presence.log')
 
@@ -43,23 +42,23 @@ logging.basicConfig(
 for _noisy_logger in ("urllib3", "asyncio"):
     logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
-RECONNECT_INTERVAL = 3
-HEARTBEAT_INTERVAL = 15
-EVENT_DEBOUNCE = 0.25
-BLANK_GRACE = 4
-RATE_LIMIT_COUNT = 4
-RATE_LIMIT_WINDOW = 20
-AD_RECHECK_INTERVAL = 1
 AD_MAX_DURATION = 65
-CONFIRM_DELAY = 15
-SCRUB_THRESHOLD = 5
+AD_RECHECK_INTERVAL = 1
 API_TIMEOUT = 5
-YTMUSIC_TIMEOUT = 6
+BLANK_GRACE = 4
+CONFIRM_DELAY = 15
+DISCORD_TEXT_LIMIT = 128
+EVENT_DEBOUNCE = 0.25
+HEARTBEAT_INTERVAL = 15
 LOOKUP_DEADLINE = 1.0
 MATCH_THRESHOLD = 0.6
-DISCORD_TEXT_LIMIT = 128
 MEDIA_CACHE_SIZE = 256
+RATE_LIMIT_COUNT = 4
+RATE_LIMIT_WINDOW = 20
+RECONNECT_INTERVAL = 3
+SCRUB_THRESHOLD = 5
 YOUTUBE_CANDIDATES = 10
+YTMUSIC_TIMEOUT = 6
 
 PLACEHOLDER_TITLES = {"A site is playing media"}
 IGNORED_APPS = ("spotify", "vlc", "foobar", "musicbee", "aimp", "zunemusic", "itunes", "applemusic")
@@ -123,6 +122,8 @@ def _is_match(title, artist, found_title, found_artists):
 
     return title_hit and artist_hit
 
+ITUNES_ALBUM_SUFFIX = re.compile(r"\s+-\s+(?:Single|EP)$")
+
 def _upscale_thumbnail(url):
     return re.sub(r"=w\d+-h\d+", "=w544-h544", url)
 
@@ -148,8 +149,10 @@ def _fetch_from_ytmusic(title, artist):
                 encoded_query = urllib.parse.quote(query)
                 button_url = f"https://music.youtube.com/search?q={encoded_query}"
 
+            album = (song.get("album") or {}).get("name")
+
             logging.info(f"🎵 YT Music match: {song.get('title', title)}")
-            return (art_url, "YouTube Music", button_url)
+            return (art_url, "YouTube Music", button_url, album)
     except Exception as e:
         logging.warning(f"YT Music API lookup failed: {e}")
 
@@ -169,8 +172,9 @@ def _fetch_from_itunes(title, artist):
                     return None
                 art = track['artworkUrl100'].replace('100x100bb', '512x512bb')
                 song_url = f"https://music.youtube.com/search?q={query}"
+                album = ITUNES_ALBUM_SUFFIX.sub("", track.get('collectionName') or "") or None
                 logging.info(f"🎵 iTunes fallback match: {title}")
-                return (art, "YouTube Music", song_url)
+                return (art, "YouTube Music", song_url, album)
     except Exception as e:
         logging.warning(f"iTunes API lookup failed: {e}")
 
@@ -209,7 +213,8 @@ def _fetch_from_youtube(title):
         return (
             f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
             "YouTube",
-            f"https://www.youtube.com/watch?v={video_id}"
+            f"https://www.youtube.com/watch?v={video_id}",
+            None
         )
     except Exception as e:
         logging.warning(f"YouTube video lookup failed: {e}")
@@ -256,7 +261,7 @@ def is_probably_ad(media):
 def youtube_fallback(title):
     video_query = urllib.parse.quote(f"{title}")
     video_url = f"https://www.youtube.com/results?search_query={video_query}"
-    return (YOUTUBE_LOGO, "YouTube", video_url)
+    return (YOUTUBE_LOGO, "YouTube", video_url, None)
 
 @lru_cache(maxsize=MEDIA_CACHE_SIZE)
 def fetch_media_data(title, artist):
@@ -284,8 +289,6 @@ def _paused_state(media):
     state = f"⏸ Paused at {_format_clock(media['position'])}"
     if media["duration"] > 0:
         state += f" / {_format_clock(media['duration'])}"
-    if media["artist"]:
-        state += f" · {media['artist']}"
     return state
 
 def _clip(text):
@@ -399,7 +402,7 @@ async def get_media_info(manager):
         "start_time": int(reference_time - position_secs)
     }
 
-def build_presence(media, platform, art_url, button_url, is_paused=False, start_time=None):
+def build_presence(media, platform, art_url, button_url, album=None, is_paused=False, start_time=None):
     state = _paused_state(media) if is_paused else (media["artist"] or "Playing Media")
 
     is_music = platform == "YouTube Music"
@@ -418,6 +421,7 @@ def build_presence(media, platform, art_url, button_url, is_paused=False, start_
         "start": start_time,
         "end": end_time,
         "large_image": art_url,
+        "large_text": _clip(album) if album and not is_paused else None,
         "small_image": PAUSED_ICON if is_paused else PLAYING_ICON,
         "small_text": "Paused" if is_paused else "Playing",
         "buttons": discord_button
@@ -519,6 +523,7 @@ async def main_loop():
     current_art_url = YOUTUBE_MUSIC_LOGO
     current_platform = "YouTube Music"
     current_button_url = "https://music.youtube.com"
+    current_album = None
 
     logging.info("Listening for media changes...")
 
@@ -574,14 +579,14 @@ async def main_loop():
                         if not branding_final:
                             if lookup_task.done():
                                 try:
-                                    current_art_url, current_platform, current_button_url = lookup_task.result()
+                                    current_art_url, current_platform, current_button_url, current_album =lookup_task.result()
                                 except Exception as e:
                                     logging.warning(f"Media lookup failed: {e}")
-                                    current_art_url, current_platform, current_button_url = youtube_fallback(media["title"])
+                                    current_art_url, current_platform, current_button_url, current_album =youtube_fallback(media["title"])
                                 branding_final = True
                                 branding_refreshed = True
                             elif track_changed:
-                                current_art_url, current_platform, current_button_url = youtube_fallback(media["title"])
+                                current_art_url, current_platform, current_button_url, current_album =youtube_fallback(media["title"])
 
                         if media["is_playing"]:
                             scrubbed = (
@@ -599,7 +604,7 @@ async def main_loop():
 
                                 await sender.push(RPC, build_presence(
                                     media, current_platform,
-                                    current_art_url, current_button_url,
+                                    current_art_url, current_button_url, current_album,
                                     is_paused=False, start_time=media["start_time"]
                                 ))
 
@@ -613,7 +618,7 @@ async def main_loop():
 
                                 await sender.push(RPC, build_presence(
                                     media, current_platform,
-                                    current_art_url, current_button_url,
+                                    current_art_url, current_button_url, current_album,
                                     is_paused=True
                                 ))
 
