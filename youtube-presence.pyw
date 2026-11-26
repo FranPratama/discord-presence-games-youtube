@@ -49,6 +49,10 @@ BLANK_GRACE = 4
 CONFIRM_DELAY = 15
 DISCORD_TEXT_LIMIT = 128
 EVENT_DEBOUNCE = 0.25
+EXTENSION_MAX_BODY = 16_384
+EXTENSION_PORT = 48217
+EXTENSION_READ_TIMEOUT = 5
+EXTENSION_STALE = 12
 HEARTBEAT_INTERVAL = 15
 LOOKUP_DEADLINE = 1.0
 MATCH_THRESHOLD = 0.6
@@ -359,6 +363,126 @@ class MediaWatcher:
         except Exception:
             pass
 
+VIDEO_ID_PATTERN = re.compile(r"[\w-]{11}")
+
+def _extension_branding(title, artist, state):
+    video_id = state.get("videoId")
+    if not (isinstance(video_id, str) and VIDEO_ID_PATTERN.fullmatch(video_id)):
+        video_id = None
+    artwork = state.get("artwork")
+    if not (isinstance(artwork, str) and artwork.startswith("https://")):
+        artwork = None
+    thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else None
+
+    if state.get("host") == "music.youtube.com":
+        art = _upscale_thumbnail(artwork) if artwork else thumbnail or YOUTUBE_MUSIC_LOGO
+        if video_id:
+            url = f"https://music.youtube.com/watch?v={video_id}"
+        else:
+            url = f"https://music.youtube.com/search?q={urllib.parse.quote(f'{title} {artist}'.strip())}"
+        return (art, "YouTube Music", url, str(state.get("album") or "") or None)
+
+    if not video_id:
+        return youtube_fallback(title)
+    return (thumbnail, "YouTube", f"https://www.youtube.com/watch?v={video_id}", None)
+
+class ExtensionFeed:
+    def __init__(self, notify):
+        self._notify = notify
+        self._tabs = {}
+
+    def update(self, payload):
+        tab_id = payload.get("tabId")
+        if tab_id is None:
+            return
+        if payload.get("gone"):
+            if self._tabs.pop(tab_id, None) is not None:
+                self._notify()
+            return
+        now = time.monotonic()
+        change_key = (payload.get("title"), payload.get("artist"), payload.get("paused"), payload.get("ad"))
+        previous = self._tabs.get(tab_id)
+        changed_at = previous[2] if previous and previous[3] == change_key else now
+        self._tabs[tab_id] = (payload, now, changed_at, change_key)
+        self._notify()
+
+    def _prune(self, now):
+        for tab_id in [tab_id for tab_id, entry in self._tabs.items() if now - entry[1] >= EXTENSION_STALE]:
+            del self._tabs[tab_id]
+
+    def current(self):
+        self._prune(time.monotonic())
+        if not self._tabs:
+            return None
+        state = max(
+            self._tabs.values(),
+            key=lambda entry: (bool(entry[0].get("ad")) or not entry[0].get("paused"), entry[2])
+        )[0]
+        try:
+            title = str(state.get("title") or "")
+            artist = str(state.get("artist") or "")
+            position = float(state.get("position") or 0)
+            duration = float(state.get("duration") or 0)
+            sent_at = float(state.get("ts") or 0) / 1000 or time.time()
+        except (TypeError, ValueError):
+            return None
+        return {
+            "title": title,
+            "artist": artist,
+            "is_playing": not state.get("paused"),
+            "position": position,
+            "duration": duration,
+            "start_time": int(sent_at - position),
+            "ad": bool(state.get("ad")),
+            "branding": _extension_branding(title, artist, state),
+        }
+
+    def seconds_until_stale(self):
+        if not self._tabs:
+            return None
+        oldest = min(entry[1] for entry in self._tabs.values())
+        return max(0.1, EXTENSION_STALE - (time.monotonic() - oldest))
+
+async def _handle_extension_request(feed, reader, writer):
+    status = b"400 Bad Request"
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), EXTENSION_READ_TIMEOUT)
+        lines = head.decode("latin-1").split("\r\n")
+        method, path, _ = lines[0].split(" ", 2)
+        headers = {}
+        for line in lines[1:]:
+            name, separator, value = line.partition(":")
+            if separator:
+                headers[name.strip().lower()] = value.strip()
+
+        if method != "POST" or path != "/presence" or headers.get("x-yt-presence") != "1":
+            status = b"403 Forbidden"
+        else:
+            length = int(headers.get("content-length", "0"))
+            if 0 < length <= EXTENSION_MAX_BODY:
+                body = await asyncio.wait_for(reader.readexactly(length), EXTENSION_READ_TIMEOUT)
+                payload = json.loads(body)
+                if isinstance(payload, dict):
+                    feed.update(payload)
+                    status = b"204 No Content"
+        writer.write(b"HTTP/1.1 " + status + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ConnectionError, ValueError) as e:
+        logging.debug(f"Bad extension request: {e!r}")
+    finally:
+        writer.close()
+
+async def start_extension_server(feed):
+    try:
+        server = await asyncio.start_server(
+            partial(_handle_extension_request, feed), "127.0.0.1", EXTENSION_PORT
+        )
+    except OSError as e:
+        logging.warning(f"Browser extension listener unavailable on port {EXTENSION_PORT}: {e}")
+        return None
+    logging.info(f"Listening for browser extension on 127.0.0.1:{EXTENSION_PORT}")
+    return server
+
 async def connect_discord():
     try:
         logging.info("Connecting to Discord...")
@@ -507,6 +631,8 @@ async def main_loop():
     wake = asyncio.Event()
     watcher = MediaWatcher(manager, asyncio.get_running_loop(), wake.set)
     sender = PresenceSender()
+    feed = ExtensionFeed(wake.set)
+    extension_server = await start_extension_server(feed)
 
     last_key = None
     last_status = None
@@ -519,6 +645,8 @@ async def main_loop():
     lookup_key = None
     lookup_task = None
     branding_final = False
+    album_key = None
+    album_task = None
 
     current_art_url = YOUTUBE_MUSIC_LOGO
     current_platform = "YouTube Music"
@@ -539,7 +667,7 @@ async def main_loop():
                 await sender.flush(RPC)
 
                 try:
-                    media = await get_media_info(manager)
+                    media = feed.current() or await get_media_info(manager)
                 except Exception as e:
                     logging.warning(f"Failed to read Windows media info: {e}")
                     await wait_for_wake(wake, RECONNECT_INTERVAL)
@@ -555,7 +683,10 @@ async def main_loop():
                             f"Track change: title={media['title']!r} artist={media['artist']!r} "
                             f"duration={media['duration']:.1f} windows={_youtube_windows()!r}"
                         )
-                    ad_active = media_key != last_key and is_probably_ad(media)
+                    if "ad" in media:
+                        ad_active = media["ad"]
+                    else:
+                        ad_active = media_key != last_key and is_probably_ad(media)
                     if ad_active:
                         if media_key != last_ad_key:
                             logging.info(f"🚫 Ad playing, clearing status: {media['title']}")
@@ -568,14 +699,32 @@ async def main_loop():
                         last_ad_key = None
                         track_changed = media_key != last_key
 
-                        if media_key != lookup_key:
+                        branding_refreshed = False
+                        if media.get("branding"):
+                            branding = media["branding"]
+                            if branding[1] == "YouTube Music" and not branding[3]:
+                                if media_key != album_key:
+                                    album_key = media_key
+                                    album_task = asyncio.create_task(asyncio.to_thread(fetch_media_data, *media_key))
+                                    album_task.add_done_callback(lambda _: wake.set())
+                                    await asyncio.wait({album_task}, timeout=LOOKUP_DEADLINE)
+                                if album_task.done() and not album_task.exception():
+                                    _, found_platform, _, found_album = album_task.result()
+                                    if found_platform == "YouTube Music" and found_album:
+                                        branding = branding[:3] + (found_album,)
+                            lookup_key = media_key
+                            lookup_task = None
+                            branding_final = True
+                            current_branding = (current_art_url, current_platform, current_button_url, current_album)
+                            branding_refreshed = current_branding != branding
+                            current_art_url, current_platform, current_button_url, current_album = branding
+                        elif media_key != lookup_key:
                             lookup_key = media_key
                             branding_final = False
                             lookup_task = asyncio.create_task(asyncio.to_thread(fetch_media_data, *media_key))
                             lookup_task.add_done_callback(lambda _: wake.set())
                             await asyncio.wait({lookup_task}, timeout=LOOKUP_DEADLINE)
 
-                        branding_refreshed = False
                         if not branding_final:
                             if lookup_task.done():
                                 try:
@@ -664,11 +813,16 @@ async def main_loop():
             pending_in = sender.seconds_until_ready() if RPC else None
             if pending_in is not None:
                 timeout = min(timeout, pending_in)
+            stale_in = feed.seconds_until_stale()
+            if stale_in is not None:
+                timeout = min(timeout, stale_in)
             await wait_for_wake(wake, timeout)
 
     finally:
         logging.info("Stopping the script. Goodbye!")
         watcher.close()
+        if extension_server:
+            extension_server.close()
         if RPC:
             try:
                 await RPC.clear()

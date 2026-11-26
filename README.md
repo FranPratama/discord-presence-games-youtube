@@ -6,7 +6,7 @@ Two small Python scripts that show what you're doing on Discord. One handles gam
 
 **game-presence.pyw** looks at your open window titles every 15 seconds. When it finds a game from its list, it shows that game on your Discord profile with a timer and a couple of buttons. Right now it knows Granblue Fantasy (in Chrome) and NIKKE, but adding more is just a matter of editing the `GAMES` list at the top of the file.
 
-**youtube-presence.pyw** reads what Windows itself reports as "now playing", the same info you see in the volume flyout. When that's YouTube or YouTube Music in your browser, it shows the title, artist, album, cover art, a progress bar, and a link back to the song or video. It reacts to play, pause, skip and seek almost instantly, and it tries to stay quiet while ads are playing.
+**youtube-presence.pyw** gets what's playing from the browser extension in the `extension` folder, which reads YouTube and YouTube Music tabs directly. Without the extension it falls back to what Windows reports as "now playing", the same info you see in the volume flyout. Either way it shows the title, artist, album, cover art, a progress bar, and a link back to the song or video. It reacts to play, pause, skip and seek almost instantly, and it tries to stay quiet while ads are playing.
 
 ## Setup
 
@@ -47,13 +47,30 @@ Each game needs its own Discord application. Create one at the [Discord Develope
 
 ### youtube-presence
 
-- Incognito and private windows don't work. The browser hides what's playing from Windows in those windows, so there's nothing for the script to read.
+- Only one thing is shown. If several YouTube tabs are reporting through the extension, a playing tab beats a paused one, and the one that changed most recently wins. Windows media info is only used when no tab is reporting.
+- Discord limits how often a status can change. If you skip through songs quickly, Discord may lag behind for up to about 20 seconds before catching up.
+- With the extension, YouTube Music tracks that don't show an album on the page still get one looked up by searching YouTube Music, which can occasionally pick the wrong album.
+- The extension talks to the script on port 48217. If something else is already using that port, the script logs a warning and works on Windows media info only.
+
+Without the extension (Windows media info only):
+
+- Incognito and private windows don't work. The browser hides what's playing from Windows in those windows, so there's nothing to read.
 - Cover art and links are found by searching YouTube Music, iTunes and YouTube using the title. Most of the time it picks the right one, but now and then it can grab a different version or fall back to the plain YouTube logo. The first lookup after starting the script can take a few seconds.
 - The YouTube search part reads YouTube's normal search page. If YouTube changes how that page looks, video thumbnails may stop working until the script is updated.
 - Ad detection is a guess based on the browser tab title and the length of the clip. Some ads may still slip through, and in rare cases a real song might be treated as an ad (for example if you're browsing a different YouTube video in the active tab while music plays in another).
-- Discord limits how often a status can change. If you skip through songs quickly, Discord may lag behind for up to about 20 seconds before catching up.
-- Only one thing is shown: whatever Windows considers the current media. Spotify, VLC and a few other players are ignored on purpose.
 - If the browser tab's title isn't visible to Windows (for example the YouTube tab isn't the active one), some features like ad detection can't do their job.
+- Spotify, VLC and a few other players are ignored on purpose.
+
+## Browser extension (recommended)
+
+The `extension` folder is a small Chrome/Edge extension that reads every YouTube and YouTube Music tab directly, normal or incognito, and sends it to `youtube-presence.pyw` on `127.0.0.1:48217`. It's the main source: you get the exact video link, the album, and real ad detection, with no search guessing. Windows media info is only used when no tab is reporting.
+
+1. Open `chrome://extensions` (or `edge://extensions`) and turn on Developer mode.
+2. Click Load unpacked and pick the `extension` folder.
+3. For incognito, open the extension's Details and turn on Allow in Incognito (Allow in InPrivate on Edge).
+4. Reload any YouTube tabs that were already open.
+
+Closing a tab drops it right away. If a tab goes quiet for 12 seconds (crashed, or the extension was reloaded), the script drops it too and goes back to Windows media info.
 
 ## Files
 
@@ -61,4 +78,5 @@ Each game needs its own Discord application. Create one at the [Discord Develope
 game-presence.pyw      game detection
 youtube-presence.pyw   YouTube / YouTube Music detection
 requirements.txt       Python packages
+extension/             browser extension that feeds youtube-presence
 ```
