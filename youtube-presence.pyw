@@ -50,21 +50,21 @@ CONFIRM_DELAY = 15
 DISCORD_TEXT_LIMIT = 128
 EVENT_DEBOUNCE = 0.25
 EXTENSION_MAX_BODY = 16_384
-EXTENSION_PORT = 48217
+EXTENSION_PORT = 48217  # must match ENDPOINT in extension/background.js
 EXTENSION_READ_TIMEOUT = 5
-EXTENSION_STALE = 12
+EXTENSION_STALE = 75  # seconds without a heartbeat before a tab is dropped; Chrome throttles hidden paused tabs to ~1 timer/min
 HEARTBEAT_INTERVAL = 15
 LOOKUP_DEADLINE = 1.0
 MATCH_THRESHOLD = 0.6
 MEDIA_CACHE_SIZE = 256
-RATE_LIMIT_COUNT = 4
+RATE_LIMIT_COUNT = 4  # max presence sends per RATE_LIMIT_WINDOW, kept under Discord's own limit
 RATE_LIMIT_WINDOW = 20
 RECONNECT_INTERVAL = 3
 SCRUB_THRESHOLD = 5
 YOUTUBE_CANDIDATES = 10
 YTMUSIC_TIMEOUT = 6
 
-PLACEHOLDER_TITLES = {"A site is playing media"}
+PLACEHOLDER_TITLES = {"A site is playing media"}  # generic title Windows gets when a site hides its metadata
 IGNORED_APPS = ("spotify", "vlc", "foobar", "musicbee", "aimp", "zunemusic", "itunes", "applemusic")
 
 CLIENT_ID = '1478129019701432400'
@@ -184,6 +184,7 @@ def _fetch_from_itunes(title, artist):
 
     return None
 
+# Scrapes YouTube's search page for a video thumbnail; breaks if YouTube changes the page JSON
 def _fetch_from_youtube(title):
     try:
         url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(title)}"
@@ -247,6 +248,7 @@ def _youtube_windows():
             tabs.append(content)
     return tabs, has_generic_tab
 
+# Fallback ad guess: media title matches no visible YouTube tab, or is a short clip behind a bare YT Music tab
 def is_probably_ad(media):
     tabs, has_generic_tab = _youtube_windows()
     if not tabs:
@@ -299,7 +301,7 @@ def _clip(text):
     text = (text or "").strip()
     if len(text) > DISCORD_TEXT_LIMIT:
         text = text[:DISCORD_TEXT_LIMIT - 1] + "…"
-    return text.ljust(2, "​")
+    return text.ljust(2, "​")  # Discord rejects fields under 2 chars, pad with zero-width space
 
 def _is_ignored(session):
     app_id = (session.source_app_user_model_id or "").lower()
@@ -386,6 +388,7 @@ def _extension_branding(title, artist, state):
         return youtube_fallback(title)
     return (thumbnail, "YouTube", f"https://www.youtube.com/watch?v={video_id}", None)
 
+# Latest state per browser tab from the extension: tab_id -> (payload, last_seen, changed_at, change_key)
 class ExtensionFeed:
     def __init__(self, notify):
         self._notify = notify
@@ -402,7 +405,7 @@ class ExtensionFeed:
         now = time.monotonic()
         change_key = (payload.get("title"), payload.get("artist"), payload.get("paused"), payload.get("ad"))
         previous = self._tabs.get(tab_id)
-        changed_at = previous[2] if previous and previous[3] == change_key else now
+        changed_at = previous[2] if previous and previous[3] == change_key else now  # heartbeats don't bump it
         self._tabs[tab_id] = (payload, now, changed_at, change_key)
         self._notify()
 
@@ -414,6 +417,7 @@ class ExtensionFeed:
         self._prune(time.monotonic())
         if not self._tabs:
             return None
+        # Ad or playing tabs beat paused ones, then the most recently changed wins
         state = max(
             self._tabs.values(),
             key=lambda entry: (bool(entry[0].get("ad")) or not entry[0].get("paused"), entry[2])
@@ -424,15 +428,19 @@ class ExtensionFeed:
             position = float(state.get("position") or 0)
             duration = float(state.get("duration") or 0)
             sent_at = float(state.get("ts") or 0) / 1000 or time.time()
+            rate = float(state.get("rate") or 1)
         except (TypeError, ValueError):
             return None
+        if not rate > 0:
+            rate = 1.0
         return {
             "title": title,
             "artist": artist,
             "is_playing": not state.get("paused"),
             "position": position,
             "duration": duration,
-            "start_time": int(sent_at - position),
+            "rate": rate,
+            "start_time": int(sent_at - position / rate),  # real-time start, so Discord's timer is right at any speed
             "ad": bool(state.get("ad")),
             "branding": _extension_branding(title, artist, state),
         }
@@ -455,7 +463,7 @@ async def _handle_extension_request(feed, reader, writer):
             if separator:
                 headers[name.strip().lower()] = value.strip()
 
-        if method != "POST" or path != "/presence" or headers.get("x-yt-presence") != "1":
+        if method != "POST" or path != "/presence" or headers.get("x-yt-presence") != "1":  # custom header forces a CORS preflight, so web pages can't post
             status = b"403 Forbidden"
         else:
             length = int(headers.get("content-length", "0"))
@@ -515,7 +523,7 @@ async def get_media_info(manager):
         duration_secs = (timeline.end_time - timeline.start_time).total_seconds()
         last_updated = timeline.last_updated_time
         if last_updated and last_updated.year >= 2000:
-            reference_time = min(last_updated.timestamp(), reference_time)
+            reference_time = min(last_updated.timestamp(), reference_time)  # position is as of last_updated, not now
 
     return {
         "title": props.title,
@@ -535,7 +543,7 @@ def build_presence(media, platform, art_url, button_url, album=None, is_paused=F
 
     end_time = None
     if start_time and media["duration"] > 0:
-        end_time = int(start_time + media["duration"])
+        end_time = int(start_time + media["duration"] / media.get("rate", 1))
 
     return {
         "activity_type": ActivityType.LISTENING if is_music else ActivityType.WATCHING,
@@ -551,6 +559,7 @@ def build_presence(media, platform, art_url, button_url, album=None, is_paused=F
         "buttons": discord_button
     }
 
+# Rate-limited sender: holds only the newest pending payload, skips duplicates, re-sends once after a burst
 class PresenceSender:
     _NOTHING = object()
 
@@ -573,7 +582,7 @@ class PresenceSender:
         else:
             await rpc.update(**payload)
         if self._sent_at and now - self._sent_at[-1] < CONFIRM_DELAY:
-            self._confirm_at = now + CONFIRM_DELAY
+            self._confirm_at = now + CONFIRM_DELAY  # Discord may drop rapid updates, so confirm the last one later
         self._sent_at.append(now)
         self._last_payload = payload
 
@@ -637,6 +646,7 @@ async def main_loop():
     last_key = None
     last_status = None
     last_start_time = 0
+    last_paused_state = None
     blank_since = None
 
     last_ad_key = None
@@ -667,7 +677,7 @@ async def main_loop():
                 await sender.flush(RPC)
 
                 try:
-                    media = feed.current() or await get_media_info(manager)
+                    media = feed.current() or await get_media_info(manager)  # Windows media only when no tab reports
                 except Exception as e:
                     logging.warning(f"Failed to read Windows media info: {e}")
                     await wait_for_wake(wake, RECONNECT_INTERVAL)
@@ -683,6 +693,7 @@ async def main_loop():
                             f"Track change: title={media['title']!r} artist={media['artist']!r} "
                             f"duration={media['duration']:.1f} windows={_youtube_windows()!r}"
                         )
+                    # Extension knows the real ad state; the fallback guesses once per new track
                     if "ad" in media:
                         ad_active = media["ad"]
                     else:
@@ -695,11 +706,13 @@ async def main_loop():
                             last_key = None
                             last_status = None
                             last_start_time = 0
+                            last_paused_state = None
                     else:
                         last_ad_key = None
                         track_changed = media_key != last_key
 
                         branding_refreshed = False
+                        # Extension branding is final; only a missing YT Music album is looked up
                         if media.get("branding"):
                             branding = media["branding"]
                             if branding[1] == "YouTube Music" and not branding[3]:
@@ -718,6 +731,7 @@ async def main_loop():
                             current_branding = (current_art_url, current_platform, current_button_url, current_album)
                             branding_refreshed = current_branding != branding
                             current_art_url, current_platform, current_button_url, current_album = branding
+                        # Windows path: wait up to LOOKUP_DEADLINE, push with fallback art, refresh when the lookup lands
                         elif media_key != lookup_key:
                             lookup_key = media_key
                             branding_final = False
@@ -738,7 +752,7 @@ async def main_loop():
                                 current_art_url, current_platform, current_button_url, current_album =youtube_fallback(media["title"])
 
                         if media["is_playing"]:
-                            scrubbed = (
+                            scrubbed = (  # start_time jump means a seek or speed change
                                 last_status == "playing"
                                 and abs(media["start_time"] - last_start_time) > SCRUB_THRESHOLD
                             )
@@ -760,10 +774,18 @@ async def main_loop():
                                 last_key = media_key
                                 last_status = "playing"
                                 last_start_time = media["start_time"]
+                                last_paused_state = None
 
                         else:
-                            if track_changed or last_status != "paused" or branding_refreshed:
-                                logging.info(f"⏸️ Paused on {current_platform}: {media['title']}")
+                            paused_state = _paused_state(media)  # changes on seek while paused, so the shown time stays right
+                            if (
+                                track_changed or last_status != "paused"
+                                or branding_refreshed or paused_state != last_paused_state
+                            ):
+                                if track_changed or last_status != "paused":
+                                    logging.info(f"⏸️ Paused on {current_platform}: {media['title']}")
+                                elif paused_state != last_paused_state:
+                                    logging.info(f"⏩ Seeked while paused on {current_platform}: {media['title']}")
 
                                 await sender.push(RPC, build_presence(
                                     media, current_platform,
@@ -774,6 +796,7 @@ async def main_loop():
                                 last_key = media_key
                                 last_status = "paused"
                                 last_start_time = 0
+                                last_paused_state = paused_state
                 elif last_key is not None:
                     current_time = time.time()
                     if blank_since is None:
@@ -784,6 +807,7 @@ async def main_loop():
                         last_key = None
                         last_status = None
                         last_start_time = 0
+                        last_paused_state = None
                         blank_since = None
 
             except exceptions.ResponseTimeout:
@@ -799,6 +823,7 @@ async def main_loop():
                 sender.reset()
                 last_key = None
                 last_status = None
+                last_paused_state = None
             except Exception:
                 logging.exception("Unexpected error in main loop")
 

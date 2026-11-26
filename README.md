@@ -70,7 +70,7 @@ The `extension` folder is a small Chrome/Edge extension that reads every YouTube
 3. For incognito, open the extension's Details and turn on Allow in Incognito (Allow in InPrivate on Edge).
 4. Reload any YouTube tabs that were already open.
 
-Closing a tab drops it right away. If a tab goes quiet for 12 seconds (crashed, or the extension was reloaded), the script drops it too and goes back to Windows media info.
+Closing a tab drops it right away. If a tab goes quiet for 75 seconds (crashed, or the extension was reloaded), the script drops it too and goes back to Windows media info.
 
 ## Files
 

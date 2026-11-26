@@ -1,12 +1,12 @@
 const TICK_MS = 1000;
-const HEARTBEAT_MS = 5000;
+const HEARTBEAT_MS = 5000; // resend unchanged state this often so the script knows the tab is alive
 const DRIFT_SECONDS = 2;
 const VIDEO_SELECTORS = ["#movie_player video", "#shorts-player video"];
 const TITLE_SUFFIX = /\s+(?:\|\s+YouTube Music|-\s+YouTube)$/;
-const TITLE_COUNTER = /^\(\d+\)\s+/;
+const TITLE_COUNTER = /^\(\d+\)\s+/; // "(3) " notification count YouTube prefixes to the title
 const ARTWORK_VIDEO_ID = /\/vi(?:_webp)?\/([\w-]{11})\//;
 const ARTIST_SELECTORS = ["ytd-watch-metadata ytd-channel-name a", "ytmusic-player-bar .byline a"];
-const ALBUM_SELECTOR = 'ytmusic-player-bar .byline a[href*="browse/MPRE"]';
+const ALBUM_SELECTOR = 'ytmusic-player-bar .byline a[href*="browse/MPRE"]'; // album links on YT Music start with MPRE
 
 let lastSent = null;
 let lastSentAt = 0;
@@ -77,18 +77,19 @@ function snapshot() {
     host: location.hostname,
     position: video.currentTime,
     duration: video.duration,
+    rate: video.playbackRate,
     paused: video.paused || video.ended,
-    ad: Boolean(player && player.classList.contains("ad-showing")),
+    ad: Boolean(player && player.classList.contains("ad-showing")), // YouTube marks the player while an ad plays
     ts: Date.now(),
   };
 }
 
 function hasChanged(state, now) {
   if (!lastSent) return true;
-  for (const key of ["title", "artist", "album", "artwork", "videoId", "paused", "ad"]) {
+  for (const key of ["title", "artist", "album", "artwork", "videoId", "rate", "paused", "ad"]) {
     if (state[key] !== lastSent[key]) return true;
   }
-  const elapsed = lastSent.paused ? 0 : (now - lastSentAt) / 1000;
+  const elapsed = lastSent.paused ? 0 : ((now - lastSentAt) / 1000) * lastSent.rate;
   return Math.abs(state.position - (lastSent.position + elapsed)) > DRIFT_SECONDS;
 }
 
@@ -96,7 +97,7 @@ function send(payload) {
   try {
     chrome.runtime.sendMessage(payload).catch(() => {});
   } catch {
-    clearInterval(timer);
+    clearInterval(timer); // extension was reloaded, this old content script can't talk to it anymore
   }
 }
 
@@ -124,10 +125,11 @@ function tick() {
 
 const timer = setInterval(tick, TICK_MS);
 
-for (const name of ["play", "pause", "seeked", "loadedmetadata", "ended"]) {
+// Media events don't bubble, so listen in the capture phase to catch them from any video
+for (const name of ["play", "pause", "seeked", "loadedmetadata", "ended", "ratechange"]) {
   document.addEventListener(name, tick, true);
 }
-document.addEventListener("yt-navigate-finish", tick);
+document.addEventListener("yt-navigate-finish", tick); // YouTube's SPA navigation event
 window.addEventListener("pageshow", tick);
 window.addEventListener("pagehide", reportGone);
 

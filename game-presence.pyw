@@ -22,12 +22,13 @@ logging.basicConfig(
 POLL_INTERVAL = 15
 RECONNECT_DELAY = 10
 
+# Earlier entries win when several games are open; each needs its own Discord application id
 GAMES = [
     {
         "name": "Granblue Fantasy",
         "client_id": "1460467337718403102",
         "triggers": ["Granblue Fantasy", "グランブルーファンタジー"],
-        "require_browser": "Chrome",
+        "require_browser": "Chrome",  # browser game: only matches while its tab is the active one in a Chrome window
         "image_key": "game-logo",
         "image_text": "Granblue Fantasy",
         "details": "Exploring the Sky Realm",
@@ -41,7 +42,7 @@ GAMES = [
         "client_id": "1472409955809366047",
         "triggers": ["GODDESS OF VICTORY", "NIKKE"],
         "require_browser": None,
-        "ignored_terms": ["Chrome", "Edge", "Firefox", "Opera", "Brave", "Wiki", "Guide"],
+        "ignored_terms": ["Chrome", "Edge", "Firefox", "Opera", "Brave", "Wiki", "Guide"],  # skip browser tabs and pages that only mention the game
         "image_key": "game-logo",
         "image_text": "GODDESS OF VICTORY: NIKKE",
         "details": "Reclaiming the Surface",
